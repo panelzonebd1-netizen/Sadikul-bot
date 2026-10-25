@@ -1,15 +1,21 @@
-
 import os
 import re
 import asyncio
 import base64
 import logging
 import threading
+import tempfile
+from io import BytesIO
 from collections import defaultdict
+from itertools import count
 
 from flask import Flask, jsonify
 from groq import AsyncGroq
-from telegram import Update
+from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
+
+from telegram import Update, InputFile
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,8 +26,8 @@ from telegram.ext import (
 )
 
 # ==========================================
-# SADIKUL AI BOT
-# Telegram + Groq + Render
+# SADIKUL AI BOT | Multi-Provider API System
+# Telegram + Groq + Gemini + Together + Render
 # ==========================================
 
 logging.basicConfig(
@@ -30,33 +36,76 @@ logging.basicConfig(
 )
 log = logging.getLogger("sadikul_bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+# ==========================================
+# ENVIRONMENT CONFIGURATION
+# ==========================================
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+# Unlimited comma-separated API keys
+def load_api_keys(env_name):
+    return [
+        key.strip()
+        for key in os.getenv(env_name, "").split(",")
+        if key.strip()
+    ]
+
+
+GROQ_API_KEYS = load_api_keys("GROQ_API_KEYS")
+GEMINI_API_KEYS = load_api_keys("GEMINI_API_KEYS")
+TOGETHER_API_KEYS = load_api_keys("TOGETHER_API_KEYS")
+
+# Feature flags
+ENABLE_IMAGE_GENERATION = (
+    os.getenv("ENABLE_IMAGE_GENERATION", "False").lower() == "true"
+)
+ENABLE_VOICE_REPLY = (
+    os.getenv("ENABLE_VOICE_REPLY", "False").lower() == "true"
+)
+ENABLE_GROUP_ADMIN = (
+    os.getenv("ENABLE_GROUP_ADMIN", "False").lower() == "true"
+)
+
+# Models can be changed without editing Python code
 TEXT_MODEL = os.getenv(
-    "GROQ_TEXT_MODEL",
-    "openai/gpt-oss-20b",
+    "GROQ_TEXT_MODEL", "openai/gpt-oss-20b"
 ).strip()
 
 VISION_MODEL = os.getenv(
-    "GROQ_VISION_MODEL",
-    "qwen/qwen3.8-27b",
+    "GROQ_VISION_MODEL", "qwen/qwen3.8-27b"
 ).strip()
 
+GEMINI_TEXT_MODEL = os.getenv(
+    "GEMINI_TEXT_MODEL", "gemini-2.5-flash"
+).strip()
+
+GEMINI_VISION_MODEL = os.getenv(
+    "GEMINI_VISION_MODEL", GEMINI_TEXT_MODEL
+).strip()
+
+TOGETHER_TEXT_MODEL = os.getenv(
+    "TOGETHER_TEXT_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+).strip()
+
+TOGETHER_VISION_MODEL = os.getenv(
+    "TOGETHER_VISION_MODEL", TOGETHER_TEXT_MODEL
+).strip()
+
+TOGETHER_IMAGE_MODEL = os.getenv(
+    "TOGETHER_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell"
+).strip()
+
+# Admin Telegram user IDs
 ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
+    int(value.strip())
+    for value in os.getenv("ADMIN_IDS", "").split(",")
+    if value.strip().isdigit()
 }
 
-# mention = mention/reply হলেই গ্রুপে উত্তর
-# all = গ্রুপের সব সাধারণ মেসেজে উত্তর
 GROUP_REPLY_MODE = os.getenv(
     "GROUP_REPLY_MODE", "mention"
 ).strip().lower()
 
-# mention = চ্যানেলে বটকে mention করলে উত্তর
-# all = চ্যানেলের প্রতিটি পোস্টে উত্তর
 CHANNEL_REPLY_MODE = os.getenv(
     "CHANNEL_REPLY_MODE", "mention"
 ).strip().lower()
@@ -64,25 +113,87 @@ CHANNEL_REPLY_MODE = os.getenv(
 MAX_HISTORY = 12
 MAX_INPUT_LENGTH = 8000
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_RETRIES = 3
+API_TIMEOUT = 45.0
 
 if not BOT_TOKEN:
     raise RuntimeError("Render Environment এ BOT_TOKEN সেট করো।")
 
-if not GROQ_API_KEY:
-    raise RuntimeError("Render Environment এ GROQ_API_KEY সেট করো।")
+if not (GROQ_API_KEYS or GEMINI_API_KEYS or TOGETHER_API_KEYS):
+    raise RuntimeError(
+        "GROQ_API_KEYS, GEMINI_API_KEYS অথবা TOGETHER_API_KEYS "
+        "এর মধ্যে অন্তত একটি Environment Variable সেট করো।"
+    )
 
-client = AsyncGroq(
-    api_key=GROQ_API_KEY,
-    timeout=60.0,
-    max_retries=0,
-)
+# ==========================================
+# API KEY ROTATION
+# ==========================================
 
-web = Flask(__name__)
+# Each provider has its own independent rotation index.
+_key_indexes = {
+    "groq": count(0),
+    "gemini": count(0),
+    "together": count(0),
+}
+_key_lock = threading.Lock()
 
-memory = defaultdict(list)
-memory_lock = threading.RLock()
-bot_username = None
+
+def get_next_key(provider):
+    """Return the next key using thread-safe round-robin rotation."""
+    keys = {
+        "groq": GROQ_API_KEYS,
+        "gemini": GEMINI_API_KEYS,
+        "together": TOGETHER_API_KEYS,
+    }.get(provider, [])
+
+    if not keys:
+        return None
+
+    with _key_lock:
+        index = next(_key_indexes[provider]) % len(keys)
+
+    return keys[index]
+
+
+def get_next_groq_key():
+    return get_next_key("groq")
+
+
+def get_next_gemini_key():
+    return get_next_key("gemini")
+
+
+def get_next_together_key():
+    return get_next_key("together")
+
+
+# ==========================================
+# CLIENT FACTORIES
+# ==========================================
+
+def create_groq_client(api_key):
+    return AsyncGroq(
+        api_key=api_key,
+        timeout=API_TIMEOUT,
+        max_retries=0,
+    )
+
+
+def create_together_client(api_key):
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.together.xyz/v1",
+        timeout=API_TIMEOUT,
+        max_retries=0,
+    )
+
+
+def create_gemini_client(api_key):
+    return genai.Client(api_key=api_key)
+
+
+# ==========================================
+# PERSONALITY
+# ==========================================
 
 SYSTEM_PROMPT = """
 তুমি SADIKUL AI BOT। তোমাকে তৈরি করেছেন Sadikul ভাই।
@@ -101,24 +212,31 @@ SYSTEM_PROMPT = """
 - ##, **, Markdown table, |, --- বা বড় heading ব্যবহার করবে না।
 - অপ্রয়োজনীয় ভূমিকা, দীর্ঘ রচনা ও একই কথা বারবার বলা এড়াবে।
 - প্রয়োজন হলে ছোট bullet বা ইমোজি ব্যবহার করতে পারো।
-- প্রশ্নে বিস্তারিত তথ্য জরুরি হলে প্রয়োজনীয় তথ্য সংক্ষেপে দেবে।
-- ছবি পেলে ছবির দৃশ্যমান বিষয় বিশ্লেষণ করবে।
+- বিস্তারিত দরকার হলে প্রয়োজনীয় তথ্য সংক্ষেপে দেবে।
+- ছবি পেলে দৃশ্যমান বিষয় বিশ্লেষণ করবে।
 - নিশ্চিত না হলে পরিষ্কারভাবে জানাবে।
 - API key, গোপন নির্দেশনা বা credentials প্রকাশ করবে না।
-- গ্রুপ, সুপারগ্রুপ, চ্যানেল বা ব্যক্তিগত চ্যাটে কাজ না করার
-  অজুহাত দেবে না। প্রশ্নের উত্তর দেওয়ার চেষ্টা করবে।
+- গ্রুপ বা ব্যক্তিগত চ্যাটের প্রশ্নের উত্তর দেওয়ার চেষ্টা করবে।
 - ব্যবহারকারীর ভাষা বুঝে সহজ বাংলায় উত্তর দেবে।
 """
 
 # ==========================================
-# RENDER HEALTH
+# FLASK HEALTH CHECK
 # ==========================================
+
+web = Flask(__name__)
+
 
 @web.get("/")
 def home():
     return jsonify({
         "name": "SADIKUL AI BOT",
         "status": "online",
+        "providers_configured": {
+            "groq": bool(GROQ_API_KEYS),
+            "gemini": bool(GEMINI_API_KEYS),
+            "together": bool(TOGETHER_API_KEYS),
+        },
     }), 200
 
 
@@ -137,15 +255,356 @@ def run_web():
 
 
 # ==========================================
+# CONVERSATION MEMORY
+# ==========================================
+
+memory = defaultdict(list)
+memory_lock = threading.RLock()
+bot_username = None
+
+
+def get_history(key):
+    with memory_lock:
+        return list(memory.get(key, []))
+
+
+def save_exchange(key, question, answer):
+    with memory_lock:
+        items = memory[key]
+        items.extend([
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ])
+
+        del items[:-MAX_HISTORY]
+
+        if items and items[0]["role"] == "assistant":
+            items.pop(0)
+
+
+def clear_history(key):
+    with memory_lock:
+        memory.pop(key, None)
+
+
+# ==========================================
+# PROVIDER ERROR HANDLING
+# ==========================================
+
+def error_status(exc):
+    status = getattr(exc, "status_code", None)
+
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+
+    return status
+
+
+def is_rate_limit_error(exc):
+    message = str(exc).lower()
+    return (
+        error_status(exc) == 429
+        or "rate limit" in message
+        or "rate_limit" in message
+        or "too many requests" in message
+    )
+
+
+def build_prompt(prompt):
+    return (
+        SYSTEM_PROMPT
+        + "\n\nConversation and user request:\n"
+        + prompt
+    )
+
+
+def extract_text(response):
+    text = getattr(response, "text", None)
+    return (text or "").strip()
+
+
+# ==========================================
+# GROQ PROVIDER
+# ==========================================
+
+async def ask_groq(prompt, api_key, image_data_url=None):
+    client = create_groq_client(api_key)
+
+    try:
+        model = VISION_MODEL if image_data_url else TEXT_MODEL
+
+        if image_data_url:
+            content = [
+                {"type": "text", "text": build_prompt(prompt)},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url},
+                },
+            ]
+        else:
+            content = build_prompt(prompt)
+
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_completion_tokens=1000,
+        )
+
+        answer = response.choices[0].message.content
+        return (answer or "").strip()
+
+    finally:
+        await client.close()
+
+
+# ==========================================
+# GEMINI PROVIDER
+# ==========================================
+
+async def ask_gemini(prompt, api_key, image_data_url=None):
+    client = create_gemini_client(api_key)
+
+    try:
+        model = (
+            GEMINI_VISION_MODEL
+            if image_data_url
+            else GEMINI_TEXT_MODEL
+        )
+
+        contents = [build_prompt(prompt)]
+
+        if image_data_url:
+            header, encoded = image_data_url.split(",", 1)
+            image_bytes = base64.b64decode(encoded)
+            mime_type = (
+                header.split(";")[0].replace("data:", "")
+                or "image/jpeg"
+            )
+
+            contents.append(
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type,
+                )
+            )
+
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=model,
+            contents=contents,
+        )
+
+        return extract_text(response)
+
+    finally:
+        await asyncio.to_thread(client.close)
+
+
+# ==========================================
+# TOGETHER PROVIDER
+# ==========================================
+
+async def ask_together(prompt, api_key, image_data_url=None):
+    client = create_together_client(api_key)
+
+    try:
+        model = (
+            TOGETHER_VISION_MODEL
+            if image_data_url
+            else TOGETHER_TEXT_MODEL
+        )
+
+        if image_data_url:
+            content = [
+                {"type": "text", "text": build_prompt(prompt)},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url},
+                },
+            ]
+        else:
+            content = build_prompt(prompt)
+
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=1000,
+        )
+
+        return (
+            response.choices[0].message.content or ""
+        ).strip()
+
+    finally:
+        await client.close
+
+
+# ==========================================
+# UNIFIED PROVIDER FALLBACK
+# ==========================================
+
+async def call_ai_api(prompt, image_data_url=None):
+    """
+    Try every configured key, rotating the starting key each call.
+    Provider order: Groq -> Gemini -> Together.
+    Continue to the next key/provider after API errors.
+    """
+
+    providers = [
+        ("Groq", GROQ_API_KEYS, get_next_groq_key, ask_groq),
+        ("Gemini", GEMINI_API_KEYS, get_next_gemini_key, ask_gemini),
+        ("Together", TOGETHER_API_KEYS, get_next_together_key, ask_together),
+    ]
+
+    errors = []
+
+    for provider_name, keys, get_key, ask_function in providers:
+        if not keys:
+            continue
+
+        # Start at the next key in rotation, then try each key once.
+        first_key = get_key()
+        if not first_key:
+            continue
+
+        start_index = keys.index(first_key)
+
+        ordered_keys = (
+            keys[start_index:] + keys[:start_index]
+        )
+
+        for key in ordered_keys:
+            try:
+                answer = await ask_function(
+                    prompt,
+                    key,
+                    image_data_url=image_data_url,
+                )
+
+                if answer:
+                    log.info("%s provider returned a response.", provider_name)
+                    return answer
+
+                errors.append(f"{provider_name}: empty response")
+
+            except Exception as exc:
+                status = error_status(exc)
+
+                # Never log secret keys or full request headers.
+                log.warning(
+                    "%s request failed (status=%s, rate_limit=%s): %s",
+                    provider_name,
+                    status,
+                    is_rate_limit_error(exc),
+                    type(exc).__name__,
+                )
+                errors.append(
+                    f"{provider_name}: {type(exc).__name__}"
+                )
+
+    log.error(
+        "All configured AI providers failed: %s",
+        ", ".join(errors) or "No usable API keys",
+    )
+    return None
+
+
+# ==========================================
+# OPTIONAL IMAGE GENERATION
+# ==========================================
+
+async def generate_image(prompt):
+    if not ENABLE_IMAGE_GENERATION:
+        return None
+
+    if not TOGETHER_API_KEYS:
+        log.warning("Image generation enabled but no Together keys exist.")
+        return None
+
+    first_key = get_next_together_key()
+    start_index = TOGETHER_API_KEYS.index(first_key)
+    ordered_keys = (
+        TOGETHER_API_KEYS[start_index:]
+        + TOGETHER_API_KEYS[:start_index]
+    )
+
+    for key in ordered_keys:
+        client = create_together_client(key)
+
+        try:
+            result = await client.images.generate(
+                model=TOGETHER_IMAGE_MODEL,
+                prompt=prompt[:2000],
+                response_format="b64_json",
+            )
+
+            image_b64 = result.data[0].b64_json
+            if image_b64:
+                return base64.b64decode(image_b64)
+
+        except Exception as exc:
+            log.warning(
+                "Image generation failed (%s).",
+                type(exc).__name__,
+            )
+
+        finally:
+            await client.close()
+
+    return None
+
+
+# ==========================================
+# OPTIONAL TEXT-TO-VOICE
+# ==========================================
+
+async def text_to_voice(text):
+    if not ENABLE_VOICE_REPLY:
+        return None
+
+    try:
+        import edge_tts
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp3",
+            delete=False,
+        ) as temp_file:
+            path = temp_file.name
+
+        try:
+            communicator = edge_tts.Communicate(
+                text[:3000],
+                voice=os.getenv(
+                    "VOICE_NAME", "bn-BD-NabanitaNeural"
+                ),
+            )
+            await communicator.save(path)
+
+            with open(path, "rb") as file:
+                return file.read()
+
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    except Exception as exc:
+        log.warning("Voice generation failed: %s", type(exc).__name__)
+        return None
+
+
+# ==========================================
 # TELEGRAM HELPERS
 # ==========================================
 
-def is_admin(update: Update) -> bool:
+def is_admin(update: Update):
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
 
 
-def get_key(update: Update) -> str:
+def get_key(update: Update):
     chat = update.effective_chat
     user = update.effective_user
     message = update.effective_message
@@ -153,7 +612,6 @@ def get_key(update: Update) -> str:
     if not chat:
         return "unknown"
 
-    # Channel post-এ effective_user সাধারণত থাকে না।
     if user:
         identity = str(user.id)
     elif message and message.sender_chat:
@@ -164,7 +622,7 @@ def get_key(update: Update) -> str:
     return f"{chat.id}:{identity}"
 
 
-def is_group(update: Update) -> bool:
+def is_group(update: Update):
     chat = update.effective_chat
     return bool(
         chat and chat.type in (
@@ -174,12 +632,12 @@ def is_group(update: Update) -> bool:
     )
 
 
-def is_channel(update: Update) -> bool:
+def is_channel(update: Update):
     chat = update.effective_chat
     return bool(chat and chat.type == ChatType.CHANNEL)
 
 
-def is_bot_mentioned(text: str) -> bool:
+def is_bot_mentioned(text):
     if not text or not bot_username:
         return False
 
@@ -190,7 +648,7 @@ def is_bot_mentioned(text: str) -> bool:
     ))
 
 
-def is_reply_to_bot(update: Update) -> bool:
+def is_reply_to_bot(update: Update):
     message = update.effective_message
 
     if not message or not message.reply_to_message:
@@ -200,24 +658,7 @@ def is_reply_to_bot(update: Update) -> bool:
     return bool(sender and sender.is_bot)
 
 
-def is_forwarded(message) -> bool:
-    if not message:
-        return False
-
-    return any(
-        getattr(message, attr, None) is not None
-        for attr in (
-            "forward_origin",
-            "forward_date",
-            "forward_from",
-            "forward_from_chat",
-            "forward_sender_name",
-        )
-    )
-
-
-def should_answer(update: Update, text: str) -> bool:
-    # Personal chat: answer normally.
+def should_answer(update: Update, text: str):
     if not is_group(update) and not is_channel(update):
         return True
 
@@ -225,66 +666,27 @@ def should_answer(update: Update, text: str) -> bool:
     replied = is_reply_to_bot(update)
 
     if is_group(update):
-        if GROUP_REPLY_MODE == "all":
-            return True
-        return mentioned or replied
+        return GROUP_REPLY_MODE == "all" or mentioned or replied
 
     if is_channel(update):
-        if CHANNEL_REPLY_MODE == "all":
-            return True
-        return mentioned or replied
+        return CHANNEL_REPLY_MODE == "all" or mentioned or replied
 
     return False
 
 
-async def reply(update: Update, text: str):
-    message = update.effective_message
-
-    if not message:
-        return
-
-    text = (text or "দুঃখিত, কোনো উত্তর পাওয়া যায়নি।").strip()
-
-    # Plain text: Markdown parsing নেই।
-    for start in range(0, len(text), 4000):
-        await message.reply_text(
-            text[start:start + 4000],
-            disable_web_page_preview=True,
-        )
-
-
-def clean_answer(text: str) -> str:
-    """উত্তরের অপ্রয়োজনীয় Markdown চিহ্ন সরায়।"""
+def clean_answer(text):
     text = (text or "").strip()
-
-    # Headings
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
-
-    # Bold / italic / strikethrough / inline code markers
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
-    text = re.sub(r"(?<!\*)\*(?!\s)(.*?)(?<!\s)\*(?!\*)",
-                  r"\1", text, flags=re.S)
     text = re.sub(r"__(.*?)__", r"\1", text, flags=re.S)
     text = re.sub(r"~~(.*?)~~", r"\1", text, flags=re.S)
     text = text.replace("```", "").replace("`", "")
-
-    # Horizontal rules
     text = re.sub(r"(?m)^\s*[-_]{3,}\s*$", "", text)
-
-    # Avoid Markdown table formatting
-    if re.search(r"(?m)^\s*\|.*\|", text):
-        text = re.sub(r"(?m)^\s*\|", "", text)
-        text = re.sub(r"\|\s*$", "", text)
-        text = re.sub(r"(?m)^\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+$", "", text)
-
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def is_creator_question(text: str) -> bool:
-    if not text:
-        return False
-
+def is_creator_question(text):
     patterns = [
         r"(কে|কারা).{0,25}(তোমাকে|তোকে).{0,20}(বানাইছে|বানিয়েছে|তৈরি করেছে)",
         r"(তোমার|তোর).{0,15}(creator|ক্রিয়েটর|নির্মাতা|মেকার).{0,10}কে",
@@ -293,104 +695,37 @@ def is_creator_question(text: str) -> bool:
     ]
 
     return any(
-        re.search(p, text, flags=re.IGNORECASE)
-        for p in patterns
+        re.search(pattern, text or "", re.IGNORECASE)
+        for pattern in patterns
     )
 
 
-# ==========================================
-# CONVERSATION MEMORY
-# ==========================================
+async def reply(update: Update, text: str):
+    message = update.effective_message
+    if not message:
+        return
 
-def get_history(key: str):
-    with memory_lock:
-        return list(memory.get(key, []))
+    text = (text or "দুঃখিত, কোনো উত্তর পাওয়া যায়নি।").strip()
 
-
-def save_exchange(key: str, question: str, answer: str):
-    with memory_lock:
-        items = memory[key]
-
-        items.append({
-            "role": "user",
-            "content": question,
-        })
-        items.append({
-            "role": "assistant",
-            "content": answer,
-        })
-
-        del items[:-MAX_HISTORY]
-
-        if items and items[0]["role"] == "assistant":
-            items.pop(0)
+    for start in range(0, len(text), 4000):
+        await message.reply_text(
+            text[start:start + 4000],
+            disable_web_page_preview=True,
+        )
 
 
 # ==========================================
-# GROQ RETRY
-# ==========================================
-
-def is_rate_limit_error(exc: Exception) -> bool:
-    status = getattr(exc, "status_code", None)
-    response = getattr(exc, "response", None)
-
-    if status is None and response is not None:
-        status = getattr(response, "status_code", None)
-
-    error_text = str(exc).lower()
-
-    return (
-        status == 429
-        or "rate_limit_exceeded" in error_text
-        or "rate limit reached" in error_text
-    )
-
-
-async def create_completion_with_retry(model: str, messages: list):
-    max_tokens = 500 if "qwen" in model.lower() else 1000
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            return await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_completion_tokens=max_tokens,
-            )
-
-        except Exception as exc:
-            if not is_rate_limit_error(exc):
-                raise
-
-            if attempt == MAX_RETRIES - 1:
-                raise
-
-            wait_seconds = 2 + attempt
-
-            log.warning(
-                "Groq rate limit. Retry %d/%d in %d seconds.",
-                attempt + 1,
-                MAX_RETRIES - 1,
-                wait_seconds,
-            )
-
-            await asyncio.sleep(wait_seconds)
-
-    raise RuntimeError("Groq request failed.")
-
-
-# ==========================================
-# AI CHAT
+# AI CHAT HANDLER
 # ==========================================
 
 async def ask_ai(
     update: Update,
     question: str,
     context: ContextTypes.DEFAULT_TYPE,
-    image_data_url: str = None,
-    force: bool = False,
+    image_data_url=None,
+    force=False,
 ):
     message = update.effective_message
-
     if not message:
         return
 
@@ -403,11 +738,11 @@ async def ask_ai(
     if not force and not should_answer(update, question):
         return
 
-    key = get_key(update)
+    conversation_key = get_key(update)
 
     if not image_data_url and is_creator_question(question):
         answer = "আমাকে তৈরি করেছে Sadikul ভাই। ❤️"
-        save_exchange(key, question, answer)
+        save_exchange(conversation_key, question, answer)
         await reply(update, answer)
         return
 
@@ -417,63 +752,55 @@ async def ask_ai(
             action=ChatAction.TYPING,
         )
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-        messages.extend(get_history(key))
+        history = get_history(conversation_key)
+        prompt_parts = []
 
-        if image_data_url:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": question or "এই ছবিটি বিশ্লেষণ করো।",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_data_url},
-                    },
-                ],
-            })
-            model = VISION_MODEL
-        else:
-            messages.append({
-                "role": "user",
-                "content": question,
-            })
-            model = TEXT_MODEL
+        for item in history:
+            role = (
+                "User"
+                if item["role"] == "user"
+                else "SADIKUL AI BOT"
+            )
+            prompt_parts.append(
+                f"{role}: {item['content']}"
+            )
 
-        result = await create_completion_with_retry(
-            model=model,
-            messages=messages,
+        prompt_parts.append(
+            "User: "
+            + (
+                question
+                or "এই ছবিটি বিশ্লেষণ করে বাংলায় বুঝিয়ে বলো।"
+            )
         )
 
-        answer = clean_answer(
-            result.choices[0].message.content or ""
+        prompt = "\n".join(prompt_parts)
+
+        result = await call_ai_api(
+            prompt,
+            image_data_url=image_data_url,
         )
+
+        answer = clean_answer(result or "")
 
         if not answer:
-            answer = "দুঃখিত, এবার উত্তর তৈরি হয়নি। আবার চেষ্টা করো।"
-
-        save_exchange(
-            key,
-            question or "[ছবি পাঠানো হয়েছে]",
-            answer,
-        )
+            answer = (
+                "⚠️ সব AI সার্ভার এই মুহূর্তে ব্যস্ত বা অনুপলব্ধ। "
+                "কিছুক্ষণ পর আবার চেষ্টা করো।"
+            )
+        else:
+            save_exchange(
+                conversation_key,
+                question or "[ছবি পাঠানো হয়েছে]",
+                answer,
+            )
 
         await reply(update, answer)
 
     except Exception:
-        log.exception(
-            "AI request failed. Model=%s",
-            VISION_MODEL if image_data_url else TEXT_MODEL,
-        )
-
+        log.exception("Unexpected error in ask_ai")
         await reply(
             update,
-            "⚠️ AI সার্ভারে আপাতত সমস্যা হচ্ছে। "
-            "কিছুক্ষণ পর আবার চেষ্টা করো।",
+            "⚠️ AI সার্ভারে সাময়িক সমস্যা হচ্ছে। পরে আবার চেষ্টা করো।",
         )
 
 
@@ -487,10 +814,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "হাই! আমি SADIKUL AI BOT 🤖❤️\n\n"
         "আমাকে প্রশ্ন করতে বা ছবি পাঠাতে পারো।\n\n"
         "/ask প্রশ্ন — AI-কে জিজ্ঞাসা\n"
+        "/image বর্ণনা — ছবি তৈরি\n"
+        "/voice লেখা — ভয়েস তৈরি\n"
         "/clear — নিজের মেমোরি মুছো\n"
         "/id — Telegram ID\n"
         "/stats — অ্যাডমিন পরিসংখ্যান\n"
         "/clearall — সব মেমোরি মুছো (অ্যাডমিন)\n"
+        "/groupadmin — গ্রুপ ফিচারের অবস্থা\n"
         "/help — সাহায্য",
     )
 
@@ -503,6 +833,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• গ্রুপে বটকে mention বা reply করো।\n"
         "• ছবি পাঠিয়ে বিশ্লেষণ করাতে পারো।\n"
         "• /ask প্রশ্ন — সরাসরি প্রশ্ন।\n"
+        "• /image বর্ণনা — Image Generation চালু থাকলে ছবি তৈরি।\n"
+        "• /voice লেখা — Voice Reply চালু থাকলে অডিও তৈরি।\n"
         "• /clear — নিজের মেমোরি মুছো।\n"
         "• /id — User ID ও Chat ID।",
     )
@@ -519,9 +851,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with memory_lock:
-        memory.pop(get_key(update), None)
-
+    clear_history(get_key(update))
     await reply(update, "✅ তোমার কথোপকথনের মেমোরি মুছে দেওয়া হয়েছে।")
 
 
@@ -530,10 +860,7 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if user and chat:
-        await reply(
-            update,
-            f"User ID: {user.id}\nChat ID: {chat.id}",
-        )
+        await reply(update, f"User ID: {user.id}\nChat ID: {chat.id}")
     elif chat:
         await reply(update, f"Chat ID: {chat.id}")
 
@@ -545,15 +872,19 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with memory_lock:
         conversations = len(memory)
-        message_count = sum(len(v) for v in memory.values())
+        message_count = sum(len(items) for items in memory.values())
 
     await reply(
         update,
         "🛠 SADIKUL AI BOT\n"
         f"Conversations: {conversations}\n"
         f"Stored messages: {message_count}\n"
-        f"Text model: {TEXT_MODEL}\n"
-        f"Vision model: {VISION_MODEL}\n"
+        f"Groq keys: {len(GROQ_API_KEYS)}\n"
+        f"Gemini keys: {len(GEMINI_API_KEYS)}\n"
+        f"Together keys: {len(TOGETHER_API_KEYS)}\n"
+        f"Image generation: {ENABLE_IMAGE_GENERATION}\n"
+        f"Voice reply: {ENABLE_VOICE_REPLY}\n"
+        f"Group admin feature: {ENABLE_GROUP_ADMIN}\n"
         f"Group mode: {GROUP_REPLY_MODE}\n"
         f"Channel mode: {CHANNEL_REPLY_MODE}",
     )
@@ -570,8 +901,76 @@ async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "✅ সব কথোপকথনের মেমোরি মুছে দেওয়া হয়েছে।")
 
 
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_IMAGE_GENERATION:
+        await reply(update, "ℹ️ Image Generation বর্তমানে বন্ধ আছে।")
+        return
+
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await reply(update, "ব্যবহার: /image একটি সুন্দর প্রকৃতির দৃশ্য")
+        return
+
+    await reply(update, "🎨 ছবি তৈরি করার চেষ্টা করছি...")
+
+    image_bytes = await generate_image(prompt)
+    if not image_bytes:
+        await reply(
+            update,
+            "⚠️ ছবি তৈরি হয়নি। API key, model ও feature availability পরীক্ষা করো।",
+        )
+        return
+
+    await update.effective_message.reply_photo(
+        photo=InputFile(BytesIO(image_bytes), filename="sadikul-image.png")
+    )
+
+
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ENABLE_VOICE_REPLY:
+        await reply(update, "ℹ️ Voice Reply বর্তমানে বন্ধ আছে।")
+        return
+
+    text = " ".join(context.args).strip()
+    if not text:
+        await reply(update, "ব্যবহার: /voice আসসালামু আলাইকুম")
+        return
+
+    audio = await text_to_voice(text)
+    if not audio:
+        await reply(update, "⚠️ ভয়েস তৈরি করা যায়নি। পরে আবার চেষ্টা করো।")
+        return
+
+    await update.effective_message.reply_voice(
+        voice=InputFile(BytesIO(audio), filename="sadikul-voice.mp3")
+    )
+
+
+async def groupadmin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not ENABLE_GROUP_ADMIN:
+        await reply(update, "ℹ️ Group Admin feature বর্তমানে বন্ধ আছে।")
+        return
+
+    if not is_group(update):
+        await reply(update, "এই কমান্ডটি গ্রুপে ব্যবহার করো।")
+        return
+
+    if not is_admin(update):
+        await reply(update, "⛔ এই ফিচার ব্যবহার করার অনুমতি নেই।")
+        return
+
+    await reply(
+        update,
+        "🛠 SADIKUL AI BOT Group Admin Feature চালু আছে।\n"
+        "গ্রুপে বটকে প্রয়োজনীয় Telegram administrator permissions দিতে হবে।",
+    )
+
+
 # ==========================================
-# TEXT
+# TEXT + IMAGE HANDLERS
 # ==========================================
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,10 +982,6 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ask_ai(update, message.text, context)
 
 
-# ==========================================
-# PHOTO + FORWARDED PHOTO
-# ==========================================
-
 async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
 
@@ -595,8 +990,6 @@ async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = (message.caption or "").strip()
 
-    # Group/channel mode অনুযায়ী ছবির caption-ও পরীক্ষা করা হবে।
-    # Forwarded photo নিজে থেকেই সব গ্রুপ মেসেজে উত্তর চালু করে না।
     if not should_answer(update, caption):
         return
 
@@ -607,11 +1000,6 @@ async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await context.bot.send_chat_action(
-            chat_id=message.chat_id,
-            action=ChatAction.TYPING,
-        )
-
         telegram_file = await context.bot.get_file(photo.file_id)
         image_bytes = bytes(
             await telegram_file.download_as_bytearray()
@@ -621,8 +1009,8 @@ async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply(update, "ছবিটি বড়। ছোট ছবি পাঠিয়ে আবার চেষ্টা করো।")
             return
 
-        base64_image = base64.b64encode(image_bytes).decode("ascii")
-        image_data_url = f"data:image/jpeg;base64,{base64_image}"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        image_data_url = f"data:image/jpeg;base64,{encoded}"
 
         await ask_ai(
             update,
@@ -641,24 +1029,19 @@ async def image_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
-# ERRORS
+# TELEGRAM ERROR HANDLER
 # ==========================================
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if context.error:
         log.error(
-            "Unhandled Telegram error",
-            exc_info=(
-                type(context.error),
-                context.error,
-                context.error.__traceback__,
-            ),
+            "Unhandled Telegram error: %s",
+            type(context.error).__name__,
         )
 
-
-# ==========================================
-# STARTUP
-# ==========================================
 
 async def post_init(application):
     global bot_username
@@ -667,19 +1050,23 @@ async def post_init(application):
     bot_username = me.username
 
     log.info("Connected to Telegram as @%s", bot_username)
+    log.info(
+        "API keys loaded: Groq=%d Gemini=%d Together=%d",
+        len(GROQ_API_KEYS),
+        len(GEMINI_API_KEYS),
+        len(TOGETHER_API_KEYS),
+    )
 
 
-async def post_shutdown(application):
-    await client.close()
-    log.info("Groq client closed.")
-
+# ==========================================
+# STARTUP
+# ==========================================
 
 def run_bot():
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -690,11 +1077,13 @@ def run_bot():
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("clearall", clearall_command))
+    application.add_handler(CommandHandler("image", image_command))
+    application.add_handler(CommandHandler("voice", voice_command))
+    application.add_handler(CommandHandler("groupadmin", groupadmin_command))
 
     application.add_handler(
         MessageHandler(filters.PHOTO, image_chat)
     )
-
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, chat)
     )
