@@ -1,6 +1,7 @@
-python-telegram-bot==20.8
-Flask==3.0.3
-groq==0.30.0
-openai==1.50.0
-google-generativeai==0.8.3
-edge-tts
+python-telegram-bot==20.7
+groq
+Flask
+gunicorn
+edge-tts==6.1.10
+python-dotenv
+aiohttp
