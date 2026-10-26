@@ -5,3 +5,5 @@ gunicorn
 edge-tts==6.1.10
 python-dotenv
 aiohttp
+openai==1.50.0
+google-generativeai==0.8.3
